@@ -6,7 +6,7 @@
 
 ### для reaper
 
-1.  скопируйте весь код из файла.
+1.  скопируйте весь код из [файла](https://github.com/rulled/reajs-voice/blob/main/voice).
 2.  внутри reaper откройте меню `actions` > `show action list...`.
 3.  в поиске найдите `jsfx: create new jsfx`.
 4.  выберите действие и нажмите `run`.
