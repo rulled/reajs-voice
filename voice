@@ -1,5 +1,4 @@
-desc:reajs chain for voice
-// Gate -> HPF -> EQ -> De-esser -> Optical Comp -> FET Comp -> Saturation -> Exciter -> Limiter
+desc:reajs-voice
 
 // GATE
 slider1:1<0,1,1{Off,On}>Gate Enable
@@ -31,9 +30,9 @@ slider18:4<2,8,0.5>FET Ratio
 slider19:3<0.1,10,0.1>FET Attack (ms)
 slider20:50<10,200,10>FET Release (ms)
 
-// SATURATION
-slider21:1<0,1,1{Off,On}>Saturation Enable
-slider22:2<0,10,0.1>Tube Drive
+// SATURATION (FIXED - No more crackling!)
+slider21:0<0,1,1{Off,On}>Saturation Enable
+slider22:3<-12,12,0.5>Sat Input Gain (dB)
 slider23:50<0,100,1>Sat Mix %
 
 // EXCITER
@@ -52,10 +51,6 @@ out_pin:right output
 
 @init
 
-ext_tail_size = -1;
-ext_nodenorm = 1;
-
-// Constants
 M_PI = 3.14159265358979323846;
 SQRT2 = 1.41421356237;
 log2db = 8.6858896380650365530225783783321;
@@ -70,60 +65,61 @@ function ratio2db(ratio) (
   log(ratio) * log2db;
 );
 
-// Gate variables
+function getFilter1K(freq_k) (
+  1.0 - exp(-2.0 * M_PI * freq_k);
+);
+
+// DENORMAL PROTECTION
+function flush_denormals(x) (
+  abs(x) < 1e-15 ? 0 : x;
+);
+
 gate_env = 0;
 gate_gain_smooth = 1;
 
-// De-esser variables
 deess_env = 0;
 deess_last = 0;
 deess_gain_smooth = 1;
 
-// De-esser bandpass filter state
-ds_x1L = ds_x2L = ds_y1L = ds_y2L = 0;
-ds_x1R = ds_x2R = ds_y1R = ds_y2R = 0;
-
-// Optical compressor variables
 opt_env = 0;
 opt_gain_calc = 1;
-runospl_opt = 0;
-rundb_opt = 0;
-maxover_opt = 0;
 
-// FET compressor variables
 fet_env = 0;
 fet_gain = 1;
 
-// Saturation variables
-sat_state = 0;
+lim_env = 0;
+lim_gain = 1;
 
-// Exciter variables
 exc_last = 0;
 
-// Limiter variables
-lim_env = 1;
-lim_gr = 1;
+// HPF state
+hpf_x1 = 0;
+hpf_x2 = 0;
+hpf_y1 = 0;
+hpf_y2 = 0;
 
-// HPF state (stereo)
-hpf_x1L = hpf_x2L = hpf_y1L = hpf_y2L = 0;
-hpf_x1R = hpf_x2R = hpf_y1R = hpf_y2R = 0;
+// EQ filters state
+eq_mud.x1 = 0;
+eq_mud.x2 = 0;
+eq_mud.y1 = 0;
+eq_mud.y2 = 0;
+eq_pres.x1 = 0;
+eq_pres.x2 = 0;
+eq_pres.y1 = 0;
+eq_pres.y2 = 0;
+eq_air.x1 = 0;
+eq_air.x2 = 0;
+eq_air.y1 = 0;
+eq_air.y2 = 0;
 
-// EQ filters state (stereo)
-eq_mud.x1L = eq_mud.x2L = eq_mud.y1L = eq_mud.y2L = 0;
-eq_mud.x1R = eq_mud.x2R = eq_mud.y1R = eq_mud.y2R = 0;
-eq_pres.x1L = eq_pres.x2L = eq_pres.y1L = eq_pres.y2L = 0;
-eq_pres.x1R = eq_pres.x2R = eq_pres.y1R = eq_pres.y2R = 0;
-eq_air.x1L = eq_air.x2L = eq_air.y1L = eq_air.y2L = 0;
-eq_air.x1R = eq_air.x2R = eq_air.y1R = eq_air.y2R = 0;
-
-// HPF coefficients - safe initial values
+// HPF coefficients
 hpf_b0 = 1;
 hpf_b1 = 0;
 hpf_b2 = 0;
 hpf_a1 = 0;
 hpf_a2 = 0;
 
-// EQ coefficients - safe initial values (bypass state)
+// EQ coefficients
 eq_mud.b0 = 1; eq_mud.b1 = 0; eq_mud.b2 = 0;
 eq_mud.a1 = 0; eq_mud.a2 = 0;
 eq_pres.b0 = 1; eq_pres.b1 = 0; eq_pres.b2 = 0;
@@ -131,14 +127,101 @@ eq_pres.a1 = 0; eq_pres.a2 = 0;
 eq_air.b0 = 1; eq_air.b1 = 0; eq_air.b2 = 0;
 eq_air.a1 = 0; eq_air.a2 = 0;
 
-// Attack time table (LA-2A style program-dependent)
-i = 0;
-loop(120,
-  attimes[i] = 2*(((0.08924 / (i+1)) + (0.60755 / ((i+1) * (i+1))) - 0.00006));
-  i += 1;
+// CONSOLE SATURATION VARIABLES (JClones_SatChannel)
+sat_mono.hpf_s = 0;
+sat_mono.hpf2_s = 0;
+sat_mono.lpf_s = 0;
+sat_mono.lpf1_s = 0;
+sat_mono.lpf2_s = 0;
+sat_mono.lpf3_s = 0;
+sat_mono.lpf4_s = 0;
+sat_mono.lpf5_s = 0;
+sat_mono.lpf6_s = 0;
+sat_mono.lpf7_s = 0;
+sat_mono.fb1 = 0;
+sat_mono.fb2 = 0;
+sat_mono.fb3 = 0;
+
+// CONSOLE SATURATION FUNCTIONS (JClones_SatChannel)
+function satFn(x) local(y) (
+  (x < -3.0) ? y = -1.0 :
+  (x > 3.0) ? y = 1.0 :
+  y = (x * x + 27.0) * x / (x * x * 9.0 + 27.0);
+  y;
 );
 
-// HPF calculation
+function SatChannel_saturate(x1) local(x2, x3, x4, lo3, hi3, x5, x6, x6_sat) (
+  x2 = (this.lpf1_s += (x1 * this.G1 - this.lpf1_s) * this.lpf1_k) +
+    1.4142135622 -
+    (this.lpf2_s += (0.0002135622 - this.lpf2_s) * this.lpf2_k);
+
+  x3 = x2 * x2 * 0.5 - 1.0;
+
+  x4 = (this.G3 * x3 - this.lpf1_s) * 5.8 + x1;
+
+  lo3 = (this.lpf3_s += ((this.fb2 - this.fb3) - this.lpf3_s) * this.lpf3_k);
+  hi3 = (this.fb2 - this.fb3) - lo3;
+
+  x5 = x4 - 0.01 - hi3 * this.G_hi3 - lo3 * this.G_lo3;
+
+  x6 = x5 - this.fb1 * this.G_fb1 - this.fb3 * this.G_fb3 + this.G4 * (this.lpf4_s += (hi3 - this.lpf4_s) * this.lpf4_k);
+
+  this.fb2 = x6;
+
+  x6_sat = satFn(x6);
+
+  this.fb3 = (this.lpf5_s += ((hi3 * this.G_hi3 * this.G_hi3_b + x6_sat + 0.008) - this.lpf5_s) * this.lpf5_k);
+
+  this.lpf6_s += (this.fb3 - this.lpf6_s) * this.lpf6_k;
+
+  this.fb1 = (this.lpf7_s += ((this.fb3 - this.lpf6_s) - this.lpf7_s) * this.lpf7_k);
+
+  // Denormal protection for all filter states
+  this.lpf1_s = flush_denormals(this.lpf1_s);
+  this.lpf2_s = flush_denormals(this.lpf2_s);
+  this.lpf3_s = flush_denormals(this.lpf3_s);
+  this.lpf4_s = flush_denormals(this.lpf4_s);
+  this.lpf5_s = flush_denormals(this.lpf5_s);
+  this.lpf6_s = flush_denormals(this.lpf6_s);
+  this.lpf7_s = flush_denormals(this.lpf7_s);
+  this.fb1 = flush_denormals(this.fb1);
+  this.fb2 = flush_denormals(this.fb2);
+  this.fb3 = flush_denormals(this.fb3);
+
+  (this.G_fb1 * this.fb1 * 0.85 + this.fb3);
+);
+
+function SatChannel_processSample(x) local(y) (
+  x *= this.input_gain;
+
+  y = (this.sat_on) ? this.SatChannel_saturate(x) : x;
+
+  y *= this.output_gain;
+
+  y = y - (this.hpf_s += (y - this.hpf_s) * this.hpf_k);
+  y = y - (this.hpf2_s += (y - this.hpf2_s) * this.hpf_k);
+
+  y = (this.lpf_s += (y - this.lpf_s) * this.lpf_k);
+
+  // Denormal protection
+  this.hpf_s = flush_denormals(this.hpf_s);
+  this.hpf2_s = flush_denormals(this.hpf2_s);
+  this.lpf_s = flush_denormals(this.lpf_s);
+
+  // Safety check
+  abs(y) > 100 ? (
+    // Reset all saturation state if output explodes
+    this.lpf1_s = this.lpf2_s = this.lpf3_s = this.lpf4_s = 0;
+    this.lpf5_s = this.lpf6_s = this.lpf7_s = 0;
+    this.fb1 = this.fb2 = this.fb3 = 0;
+    this.hpf_s = this.hpf2_s = this.lpf_s = 0;
+    y = 0;
+  );
+
+  y;
+);
+
+// EQ filters
 function calc_hpf(freq) (
   omega = 2 * M_PI * freq / srate;
   sn = sin(omega);
@@ -160,7 +243,6 @@ function calc_hpf(freq) (
   hpf_a2 = a2 / a0;
 );
 
-// Peak filter calculation
 function calc_peak(freq, gain_db, q) (
   A = exp(gain_db * db2log);
   omega = 2 * M_PI * freq / srate;
@@ -182,7 +264,6 @@ function calc_peak(freq, gain_db, q) (
   this.a2 = a2 / a0;
 );
 
-// Shelf filter calculation
 function calc_shelf(freq, gain_db, slope) (
   A = exp(gain_db * db2log);
   omega = 2 * M_PI * freq / srate;
@@ -205,98 +286,41 @@ function calc_shelf(freq, gain_db, slope) (
   this.a2 = a2 / a0;
 );
 
-// Biquad filter processing for left channel
-function process_biquad_L(sample) (
-  output = this.b0 * sample + this.b1 * this.x1L + this.b2 * this.x2L
-           - this.a1 * this.y1L - this.a2 * this.y2L;
+// Biquad filter processing
+function process_biquad(sample) local(output) (
+  output = this.b0 * sample + this.b1 * this.x1 + this.b2 * this.x2
+           - this.a1 * this.y1 - this.a2 * this.y2;
 
-  // Check for filter instability
+  // === Проверка на сбой фильтра + denormal protection ===
   abs(output) > 1e6 ? (
-    this.x1L = this.x2L = this.y1L = this.y2L = 0;
-    output = 0;
+    this.x1 = this.x2 = this.y1 = this.y2 = 0; // Сброс состояния
+    output = 0; // Выдать 0 на этом сэмпле
   );
 
-  this.x2L = this.x1L;
-  this.x1L = sample;
-  this.y2L = this.y1L;
-  this.y1L = output;
+  this.x2 = this.x1;
+  this.x1 = sample;
+  this.y2 = this.y1;
+  this.y1 = output;
+
+  // Flush denormals from filter state
+  this.x1 = flush_denormals(this.x1);
+  this.x2 = flush_denormals(this.x2);
+  this.y1 = flush_denormals(this.y1);
+  this.y2 = flush_denormals(this.y2);
 
   output;
-);
-
-// Biquad filter processing for right channel
-function process_biquad_R(sample) (
-  output = this.b0 * sample + this.b1 * this.x1R + this.b2 * this.x2R
-           - this.a1 * this.y1R - this.a2 * this.y2R;
-
-  // Check for filter instability
-  abs(output) > 1e6 ? (
-    this.x1R = this.x2R = this.y1R = this.y2R = 0;
-    output = 0;
-  );
-
-  this.x2R = this.x1R;
-  this.x1R = sample;
-  this.y2R = this.y1R;
-  this.y1R = output;
-
-  output;
-);
-
-// Soft clipper for saturation
-function soft_clip(x) (
-  x = max(-3, min(3, x));
-  x < -1 ? (
-    -(2/3 - (x + 1) * (x + 1) / 3);
-  ) : x > 1 ? (
-    2/3 - (x - 1) * (x - 1) / 3;
-  ) : (
-    x;
-  );
-);
-
-// Tube saturation with harmonics
-function tube_sat(x, drive) (
-  driven = x * drive;
-  // Asymmetrical clipping for even harmonics
-  driven > 0 ? (
-    soft_clip(driven * 1.2) / 1.2;
-  ) : (
-    soft_clip(driven * 0.9) / 0.9;
-  );
 );
 
 @slider
 
 // Gate parameters
-gate_thresh = db2ratio(slider2);
+gate_thresh = exp(slider2 * db2log);
 gate_att = exp(-1 / (slider3 * 0.001 * srate));
 gate_rel = exp(-1 / (slider4 * 0.001 * srate));
 
 // De-esser setup
 deess_freq = slider6;
-deess_reduction = db2ratio(-slider7);
-
-// De-esser bandpass filter (for better sibilance detection)
-ds_omega = 2 * M_PI * deess_freq / srate;
-ds_Q = 3.0;
-ds_alpha = sin(ds_omega) / (2 * ds_Q);
-
-ds_b0 = ds_alpha;
-ds_b1 = 0;
-ds_b2 = -ds_alpha;
-ds_a0 = 1 + ds_alpha;
-ds_a1 = -2 * cos(ds_omega);
-ds_a2 = 1 - ds_alpha;
-
-ds_a1 /= ds_a0;
-ds_a2 /= ds_a0;
-ds_b0 /= ds_a0;
-ds_b1 /= ds_a0;
-ds_b2 /= ds_a0;
-
-ds_attack_coef = exp(-1 / (0.001 * srate)); // 1ms attack
-ds_release_coef = exp(-1 / (0.050 * srate)); // 50ms release
+deess_reduction = exp(-slider7 * db2log);
 
 // EQ calculation
 calc_hpf(slider9);
@@ -304,34 +328,56 @@ eq_mud.calc_peak(250, slider10, 1.5);
 eq_pres.calc_peak(3000, slider11, 1.2);
 eq_air.calc_shelf(10000, slider12, 0.7);
 
-// Optical Compressor (slow attack/release like LA-2A)
+// Optical Compressor
 opt_peak_red = slider14 / 100;
 opt_makeup = exp(slider15 * 0.05773502692); // makeup gain
 opt_a = exp(-1 / (0.010 * srate)); // 10ms attack
 opt_r = exp(-1 / (0.060 * srate)); // 60ms base release
 
-// Convert peak reduction to threshold (like LA-2A)
-opt_thresh = -opt_peak_red * 60;
-opt_threshv = db2ratio(opt_thresh / 1.2);
-opt_ratio = 4;
-opt_knee_width = abs(opt_thresh * 2 * 10 * 0.01);
-opt_rmscoef = exp(-1 / (0.0025 * srate));
-
-// FET Compressor (fast like 1176)
-fet_thresh = db2ratio(slider17);
+// FET Compressor
+fet_thresh = exp(slider17 * db2log);
 fet_ratio = slider18;
 fet_att = exp(-1 / (slider19 * 0.001 * srate));
 fet_rel = exp(-1 / (slider20 * 0.001 * srate));
 
-// Saturation
-sat_drive = 1 + slider22 * 0.5;
+
+// CONSOLE SATURATION SETUP (JClones_SatChannel)
+sat_enable = slider21;
+sat_input_gain_dB = slider22;
 sat_mix = slider23 / 100;
+
+sat_enable ? (
+  // Normal mode (без Fat Mode - сохраняем простоту оригинала)
+  sat_mono.G_fb3 = 0.6;
+  sat_mono.G_hi3_b = 0.6;
+  sat_mono.G_lo3 = 0.410706;
+  sat_mono.lpf5_k = 0.512;
+  sat_mono.G4 = 1.3;
+  sat_mono.lpf1_k = getFilter1K(120.0 / srate);
+  sat_mono.lpf4_k = getFilter1K(80.0 / srate);
+  sat_mono.G3 = 0.735;
+  sat_mono.G_fb1 = 0.4;
+  sat_mono.G_hi3 = 0.15;
+  sat_mono.G1 = 0.4;
+
+  sat_mono.output_gain = db2ratio(11.654);
+  sat_mono.input_gain = db2ratio(-8.0 + sat_input_gain_dB);
+
+  sat_mono.lpf6_k = getFilter1K(320.0 / srate);
+  sat_mono.lpf7_k = getFilter1K(20000.0 / srate);
+  sat_mono.lpf3_k = getFilter1K(5.0 / srate);
+  sat_mono.lpf2_k = getFilter1K(1.0);
+
+  sat_mono.sat_on = 1;
+  sat_mono.hpf_k = getFilter1K(10.0 / srate);
+  sat_mono.lpf_k = getFilter1K(20000.0 / srate);
+);
 
 // Exciter
 excite_amt = slider25 / 100;
 
 // Limiter
-limit_ceil = db2ratio(slider27);
+limit_ceil = exp(slider27 * db2log);
 limit_att = exp(-1 / (0.001 * srate)); // 1ms attack
 limit_rel = exp(-1 / (0.100 * srate)); // 100ms release
 
@@ -340,15 +386,25 @@ out_gain = slider28 / 100;
 
 @sample
 
+spl0 = max(-100, min(100, spl0));
+spl1 = max(-100, min(100, spl1));
+
+mono = (spl0 + spl1) * 0.5;
+spl0 = mono;
+spl1 = mono;
+
 // GATE
 slider1 ? (
-  input_level = max(abs(spl0), abs(spl1));
+  input_level = abs(spl0); // Только один канал, т.к. уже моно
+  input_level = min(input_level, 1000); // Safety cap
 
   input_level > gate_env ? (
     gate_env = gate_att * (gate_env - input_level) + input_level;
   ) : (
     gate_env = gate_rel * (gate_env - input_level) + input_level;
   );
+
+  gate_env = flush_denormals(gate_env); // Denormal protection
 
   gate_gain = gate_env > gate_thresh ? 1 : 0;
   gate_gain = gate_gain * 0.1 + gate_gain_smooth * 0.9;
@@ -358,78 +414,49 @@ slider1 ? (
   spl1 *= gate_gain;
 );
 
-// EQ SECTION
+// EQ SECTION (MONO)
 slider8 ? (
-  // HIGH-PASS FILTER - Left channel
-  spl0_hpf = hpf_b0 * spl0 + hpf_b1 * hpf_x1L + hpf_b2 * hpf_x2L
-             - hpf_a1 * hpf_y1L - hpf_a2 * hpf_y2L;
+  // HIGH-PASS FILTER - только один канал
+  spl0_hpf = hpf_b0 * spl0 + hpf_b1 * hpf_x1 + hpf_b2 * hpf_x2
+             - hpf_a1 * hpf_y1 - hpf_a2 * hpf_y2;
 
+  // === ИСПРАВЛЕНИЕ: Проверка на сбой фильтра ===
   abs(spl0_hpf) > 1e6 ? (
-    hpf_x1L = hpf_x2L = hpf_y1L = hpf_y2L = 0;
-    spl0_hpf = 0;
+      hpf_x1 = hpf_x2 = hpf_y1 = hpf_y2 = 0; // Сброс состояния
+      spl0_hpf = 0; // Выдать 0 на этом сэмпле
   );
 
-  hpf_x2L = hpf_x1L;
-  hpf_x1L = spl0;
-  hpf_y2L = hpf_y1L;
-  hpf_y1L = spl0_hpf;
+  hpf_x2 = hpf_x1;
+  hpf_x1 = spl0;
+  hpf_y2 = hpf_y1;
+  hpf_y1 = spl0_hpf;
+
   spl0 = spl0_hpf;
+  spl1 = spl0_hpf; // Копируем в правый канал
 
-  // HIGH-PASS FILTER - Right channel
-  spl1_hpf = hpf_b0 * spl1 + hpf_b1 * hpf_x1R + hpf_b2 * hpf_x2R
-             - hpf_a1 * hpf_y1R - hpf_a2 * hpf_y2R;
+  // PARAMETRIC EQ - только один канал
+  spl0 = eq_mud.process_biquad(spl0);
+  spl0 = eq_pres.process_biquad(spl0);
+  spl0 = eq_air.process_biquad(spl0);
 
-  abs(spl1_hpf) > 1e6 ? (
-    hpf_x1R = hpf_x2R = hpf_y1R = hpf_y2R = 0;
-    spl1_hpf = 0;
-  );
-
-  hpf_x2R = hpf_x1R;
-  hpf_x1R = spl1;
-  hpf_y2R = hpf_y1R;
-  hpf_y1R = spl1_hpf;
-  spl1 = spl1_hpf;
-
-  // PARAMETRIC EQ - Process both channels
-  spl0 = eq_mud.process_biquad_L(spl0);
-  spl0 = eq_pres.process_biquad_L(spl0);
-  spl0 = eq_air.process_biquad_L(spl0);
-
-  spl1 = eq_mud.process_biquad_R(spl1);
-  spl1 = eq_pres.process_biquad_R(spl1);
-  spl1 = eq_air.process_biquad_R(spl1);
+  spl1 = spl0; // Копируем обработанный сигнал в правый канал
 );
 
-// DE-ESSER
+// DE-ESSER (MONO)
 slider5 ? (
-  // Bandpass filter to detect sibilance - Left
-  ds_x2L = ds_x1L;
-  ds_x1L = ds_x0L;
-  ds_x0L = spl0;
-
-  ds_y2L = ds_y1L;
-  ds_y1L = ds_y0L;
-  ds_y0L = ds_b0 * ds_x0L + ds_b1 * ds_x1L + ds_b2 * ds_x2L - ds_a1 * ds_y1L - ds_a2 * ds_y2L;
-
-  // Bandpass filter to detect sibilance - Right
-  ds_x2R = ds_x1R;
-  ds_x1R = ds_x0R;
-  ds_x0R = spl1;
-
-  ds_y2R = ds_y1R;
-  ds_y1R = ds_y0R;
-  ds_y0R = ds_b0 * ds_x0R + ds_b1 * ds_x1R + ds_b2 * ds_x2R - ds_a1 * ds_y1R - ds_a2 * ds_y2R;
-
-  // Envelope detection
-  deess_detect = max(abs(ds_y0L), abs(ds_y0R));
+  // Детектируем высокие частоты - только один канал
+  deess_detect = abs(spl0 - deess_last);
+  deess_last = spl0;
 
   deess_detect > deess_env ? (
-    deess_env = ds_attack_coef * (deess_env - deess_detect) + deess_detect;
+    deess_env = 0.9 * deess_env + 0.1 * deess_detect;
   ) : (
-    deess_env = ds_release_coef * (deess_env - deess_detect) + deess_detect;
+    deess_env = 0.99 * deess_env + 0.01 * deess_detect;
   );
 
-  deess_gain = deess_env > 0.3 ? deess_reduction : 1.0;
+  deess_env = flush_denormals(deess_env); // Denormal protection
+
+  deess_gain = deess_env > 0.5 ? deess_reduction : 1.0;
   deess_gain = 0.9 * deess_gain_smooth + 0.1 * deess_gain;
   deess_gain_smooth = deess_gain;
 
@@ -437,69 +464,47 @@ slider5 ? (
   spl1 *= deess_gain;
 );
 
-// OPTICAL COMPRESSOR (LA-2A style)
+// OPTICAL COMPRESSOR (LA-2A style MONO)
 slider13 ? (
-  // RMS detection
-  aspl0_opt = abs(spl0);
-  aspl1_opt = abs(spl1);
-  maxspl_opt = max(aspl0_opt, aspl1_opt);
-  maxspl_opt = maxspl_opt * maxspl_opt;
-  runospl_opt = maxspl_opt + opt_rmscoef * (runospl_opt - maxspl_opt);
-  det_opt = sqrt(max(0, runospl_opt));
+  opt_level = abs(spl0); // Только один канал
+  opt_level = min(opt_level, 10); // Safety cap - prevent extreme values
 
-  // Soft knee compression
-  det_opt = max(det_opt, 0.0000000001);
-  mydbin_opt = ratio2db(det_opt);
-
-  Thi_opt = opt_thresh + opt_knee_width / 2;
-  Tlo_opt = opt_thresh - opt_knee_width / 2;
-  slope_opt = (1 - opt_ratio) / opt_ratio;
-  knee_factor_opt = abs(slope_opt) / (opt_knee_width * 2);
-
-  mydbin_opt < Tlo_opt ? (
-    overdb_opt = 0;
-  ) : mydbin_opt >= Thi_opt ? (
-    overdb_opt = abs(slope_opt) * (mydbin_opt - opt_thresh);
+  opt_level > opt_env ? (
+    opt_env = opt_a * (opt_env - opt_level) + opt_level;
   ) : (
-    mydelta_opt = mydbin_opt - Tlo_opt;
-    overdb_opt = mydelta_opt * mydelta_opt * knee_factor_opt;
+    // Программно-зависимый релиз: медленнее при большем сигнале
+    rel_coeff = opt_r + (1 - opt_r) * min(opt_env, 2) * 2; // Cap opt_env in formula to prevent explosion
+    rel_coeff = min(rel_coeff, 0.999); // Safety cap for rel_coeff
+    opt_env = rel_coeff * opt_env + (1 - rel_coeff) * opt_level;
   );
 
-  // Program-dependent attack (LA-2A style)
-  overdb_opt > maxover_opt ? (
-    maxover_opt = overdb_opt;
-    attime_opt = attimes[max(0, min(119, floor(abs(overdb_opt))))];
-    opt_atcoef = exp(-1 / (attime_opt * srate));
-    reltime_opt = overdb_opt / 25;
-    opt_relcoef = exp(-1 / (reltime_opt * srate));
-  );
+  opt_env = flush_denormals(opt_env); // Denormal protection
+  opt_env = min(opt_env, 100); // Hard cap on envelope - prevent runaway
 
-  overdb_opt = max(0, overdb_opt);
+  // Мягкое колено оптического компрессора
+  // Peak Reduction определяет насколько сильно компрессируем
+  opt_target = 0.5; // целевой уровень
+  opt_over = opt_env / opt_target;
 
-  // Envelope follower
-  overdb_opt > rundb_opt ? (
-    rundb_opt = overdb_opt + opt_atcoef * (rundb_opt - overdb_opt);
+  opt_over > 1 ? (
+    // Логарифмическая компрессия как у LA-2A
+    reduction_amount = (opt_over - 1) * opt_peak_red;
+    reduction_amount = min(reduction_amount, 9); // Max 10:1 reduction (prevent gain going to zero)
+    opt_gain_calc = 1 / (1 + reduction_amount);
+    opt_gain_calc = max(opt_gain_calc, 0.1); // Minimum gain = 0.1 (-20dB max reduction)
   ) : (
-    rundb_opt = overdb_opt + opt_relcoef * (rundb_opt - overdb_opt);
+    opt_gain_calc = 1;
   );
 
-  overdb_opt = rundb_opt;
-
-  // Calculate gain reduction
-  cratio_opt = 1 + (opt_ratio - 1) * min(overdb_opt, 6) / 6;
-  gr_opt = -overdb_opt * cratio_opt * (cratio_opt - 1) / cratio_opt;
-  opt_grv = db2ratio(gr_opt);
-
-  maxover_opt = maxover_opt + opt_relcoef * (maxover_opt - maxover_opt * 0.99);
-
-  // Apply compression with makeup gain
-  spl0 *= opt_grv * opt_makeup;
-  spl1 *= opt_grv * opt_makeup;
+  // Применяем gain с makeup gain
+  spl0 *= opt_gain_calc * opt_makeup;
+  spl1 *= opt_gain_calc * opt_makeup;
 );
 
-// FET COMPRESSOR (1176 style)
+// FET COMPRESSOR (1176 style MONO)
 slider16 ? (
-  fet_level = max(abs(spl0), abs(spl1));
+  fet_level = abs(spl0); // Только один канал
+  fet_level = min(fet_level, 1000); // Safety cap
 
   fet_level > fet_env ? (
     fet_env = fet_att * (fet_env - fet_level) + fet_level;
@@ -507,9 +512,12 @@ slider16 ? (
     fet_env = fet_rel * (fet_env - fet_level) + fet_level;
   );
 
+  fet_env = flush_denormals(fet_env); // Denormal protection
+
   fet_over = fet_env / fet_thresh;
   fet_over > 1 ? (
     fet_gain = 1 / pow(fet_over, (fet_ratio - 1) / fet_ratio);
+    fet_gain = max(fet_gain, 0.05); // Minimum gain = 0.05 (-26dB max reduction)
   ) : (
     fet_gain = 1;
   );
@@ -518,47 +526,48 @@ slider16 ? (
   spl1 *= fet_gain;
 );
 
-// SATURATION (Tube warmth)
+// CONSOLE SATURATION (JClones_SatChannel)
 slider21 ? (
-  dry0 = spl0;
-  dry1 = spl1;
+  dry = spl0; // Только один канал
 
-  // Tube saturation
-  wet0 = tube_sat(spl0, sat_drive);
-  wet1 = tube_sat(spl1, sat_drive);
+  // Professional console saturation (NO ALIASING!)
+  wet = sat_mono.SatChannel_processSample(spl0);
 
-  // Mix dry/wet
-  spl0 = dry0 * (1 - sat_mix) + wet0 * sat_mix;
-  spl1 = dry1 * (1 - sat_mix) + wet1 * sat_mix;
+  // Mix dry/wet (как в оригинале)
+  spl0 = dry * (1 - sat_mix) + wet * sat_mix;
 
-  // Level compensation
+  // Компенсация уровня (как в оригинале)
   spl0 *= 0.8;
-  spl1 *= 0.8;
+
+  spl1 = spl0; // Копируем в правый канал
 );
 
-// EXCITER (High frequency enhancement)
+// EXCITER (High frequency enhancement MONO)
+// ОРИГИНАЛЬНЫЙ ЭКСАЙТЕР - тёплый, мягкий, музыкальный
 slider24 ? (
-  // Generate harmonics - stereo
-  exc0 = spl0 * spl0 * sign(spl0);
-  exc1 = spl1 * spl1 * sign(spl1);
+  // Генерируем гармоники - только один канал
+  exc = spl0 * spl0 * sign(spl0);
 
-  // High-pass for exciter (simple)
-  exc0 = exc0 * 0.5 - exc_last * 0.5;
+  // High-pass для эксайтера
+  exc = exc * 0.5 - exc_last * 0.5;
   exc_last = spl0 * spl0 * sign(spl0);
 
-  spl0 += exc0 * excite_amt * 0.3;
-  spl1 += exc1 * excite_amt * 0.3;
+  spl0 += exc * excite_amt * 0.3;
+  spl1 = spl0; // Копируем в правый канал
 );
 
-// FINAL LIMITER
+// FINAL LIMITER (MONO)
 slider26 ? (
-  lim_level = max(abs(spl0), abs(spl1));
+  lim_level = abs(spl0); // Только один канал
+  lim_level = min(lim_level, 1000); // Safety cap
 
   lim_level > lim_env ? (
     lim_env = limit_att * (lim_env - lim_level) + lim_level;
   ) : (
     lim_env = limit_rel * (lim_env - lim_level) + lim_level;
   );
+
+  lim_env = flush_denormals(lim_env); // Denormal protection
 
   lim_over = lim_env / limit_ceil;
   lim_over > 1 ? (
@@ -579,3 +588,63 @@ slider26 ? (
 // OUTPUT GAIN
 spl0 *= out_gain;
 spl1 *= out_gain;
+
+spl0 = max(-10, min(10, spl0)); // Final safety clip
+spl1 = max(-10, min(10, spl1));
+spl0 = flush_denormals(spl0); // Final denormal flush
+spl1 = flush_denormals(spl1);
+
+@gfx 600 400
+
+// DEBUG
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_a = 1;
+
+gfx_x = 10; gfx_y = 10;
+gfx_drawstr("=== DEBUG MONITOR ===\n\n");
+
+gfx_x = 10; gfx_y = 40;
+gfx_r = 0.5; gfx_g = 1; gfx_b = 0.5;
+gfx_drawstr(sprintf(#, "Input Level: %.4f (%.2f dB)\n", abs(spl0), ratio2db(abs(spl0))));
+
+gfx_x = 10; gfx_y = 70;
+gfx_r = 1; gfx_g = 1; gfx_b = 0.5;
+gfx_drawstr(sprintf(#, "Gate Envelope: %.6f\n", gate_env));
+gfx_x = 10; gfx_y = 90;
+gfx_drawstr(sprintf(#, "Gate Gain: %.6f\n", gate_gain_smooth));
+
+gfx_x = 10; gfx_y = 120;
+gfx_r = 1; gfx_g = 0.5; gfx_b = 0.5;
+gfx_drawstr(sprintf(#, "OPT Envelope: %.6f\n", opt_env));
+gfx_x = 10; gfx_y = 140;
+gfx_drawstr(sprintf(#, "OPT Gain: %.6f (%.2f dB)\n", opt_gain_calc, ratio2db(opt_gain_calc)));
+gfx_x = 10; gfx_y = 160;
+gfx_drawstr(sprintf(#, "OPT reduction_amount: %.6f\n", reduction_amount));
+gfx_x = 10; gfx_y = 180;
+gfx_drawstr(sprintf(#, "OPT rel_coeff: %.6f\n", rel_coeff));
+
+gfx_x = 10; gfx_y = 210;
+gfx_r = 1; gfx_g = 0.7; gfx_b = 0.3;
+gfx_drawstr(sprintf(#, "FET Envelope: %.6f\n", fet_env));
+gfx_x = 10; gfx_y = 230;
+gfx_drawstr(sprintf(#, "FET Gain: %.6f (%.2f dB)\n", fet_gain, ratio2db(fet_gain)));
+
+gfx_x = 10; gfx_y = 260;
+gfx_r = 0.7; gfx_g = 0.5; gfx_b = 1;
+gfx_drawstr(sprintf(#, "DeEsser Envelope: %.6f\n", deess_env));
+gfx_x = 10; gfx_y = 280;
+gfx_drawstr(sprintf(#, "DeEsser Gain: %.6f\n", deess_gain_smooth));
+
+gfx_x = 10; gfx_y = 310;
+gfx_r = 1; gfx_g = 0.3; gfx_b = 0.3;
+gfx_drawstr(sprintf(#, "Limiter Envelope: %.6f\n", lim_env));
+gfx_x = 10; gfx_y = 330;
+gfx_drawstr(sprintf(#, "Limiter Gain: %.6f (%.2f dB)\n", lim_gain, ratio2db(lim_gain)));
+
+gfx_x = 10; gfx_y = 360;
+gfx_r = 0.5; gfx_g = 1; gfx_b = 1;
+gfx_drawstr(sprintf(#, "Output Level: %.4f (%.2f dB)\n", abs(spl0), ratio2db(abs(spl0))));
+
+gfx_x = 10; gfx_y = 380;
+gfx_r = 1; gfx_g = 1; gfx_b = 1;
+gfx_drawstr("Watch for values that stick/don't recover");
